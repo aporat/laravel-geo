@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # Lint, static analysis and the coverage run, on the locked dependency set.
+  qa:
+    name: Quality Assurance
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: json, phar, zlib
+          ini-values: memory_limit=-1
+          tools: composer:v2
+          coverage: xdebug
+
+      - name: Install Dependencies
+        uses: ramsey/composer-install@v4
+
+      - name: Execute linter
+        run: composer check
+
+      - name: Execute static analysis
+        run: composer analyze
+
+      - name: Execute tests with coverage
+        run: composer test-ci
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: ${{ github.repository }}
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: ${{ github.repository }}
+
+  # The test suite against each supported PHP and Laravel major. The Laravel
+  # version is required explicitly and resolved fresh rather than installed
+  # from composer.lock, which pins a single Laravel major.
+  tests:
+    name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }}${{ matrix.dependencies == 'lowest' && ' / lowest' || '' }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.4', '8.5']
+        laravel: ['12', '13']
+        dependencies: [highest]
+        include:
+          - php: '8.4'
+            laravel: '12'
+            dependencies: lowest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: json, phar, zlib
+          ini-values: memory_limit=-1
+          tools: composer:v2
+          coverage: none
+
+      - name: Require Laravel ${{ matrix.laravel }}
+        env:
+          LARAVEL: ${{ matrix.laravel }}
+        run: |
+          case "$LARAVEL" in
+            12) TESTBENCH='^10.0' ;;
+            13) TESTBENCH='^11.0' ;;
+            *) echo "No Testbench mapping for Laravel $LARAVEL" >&2; exit 1 ;;
+          esac
+          composer require "laravel/framework:^${LARAVEL}.0" --no-update --no-interaction
+          composer require --dev "orchestra/testbench:${TESTBENCH}" --no-update --no-interaction
+
+      - name: Install Dependencies (${{ matrix.dependencies }})
+        uses: ramsey/composer-install@v4
+        with:
+          dependency-versions: ${{ matrix.dependencies }}
+          composer-options: --with-all-dependencies
+
+      - name: Check the installed Laravel version
+        env:
+          LARAVEL: ${{ matrix.laravel }}
+        run: |
+          installed=$(composer show laravel/framework --format=json | php -r 'echo json_decode(stream_get_contents(STDIN), true)["versions"][0];')
+          echo "Installed laravel/framework $installed"
+          case "${installed#v}" in
+            "$LARAVEL".*) ;;
+            *) echo "Expected Laravel $LARAVEL.x, got $installed" >&2; exit 1 ;;
+          esac
+
+      - name: Execute tests
+        run: composer test
